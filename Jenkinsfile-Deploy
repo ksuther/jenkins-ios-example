@@ -1,0 +1,165 @@
+#!groovy
+
+@Library('shared') _
+
+def sendSlackNotifications() {
+    // Send Slack status notifications?
+    false
+}
+
+node {
+    def startTime = System.currentTimeMillis()
+
+    try {
+        stage('Check project') {
+            if (sendSlackNotifications()) {
+                slackSend channel: '#general', color: colorForBuildResult(currentBuild.getPreviousBuild()), message: slackMessagePrefix() + " Started (<${env.BUILD_URL}|Open>)"
+            }
+
+            checkout scm
+
+            // Delete and recreate build directory
+            dir('build') {
+                deleteDir()
+            }
+
+            sh "mkdir -p build"
+
+            // Write changes to a file for puck
+            sh "echo '$HOCKEY_CHANGES' > build/hockey_changes.txt"
+        }
+
+        stage('Bundle Version (HockeyApp)') {
+            // Increment bundle version and commit (for Hockey)
+            sh "perl -pi -e 's{BUNDLE_VERSION = (\\d+)}{\$n=\$1+1; \"BUNDLE_VERSION = \$n\"}e' '${env.WORKSPACE}'/xcconfig/Bundle-Version.xcconfig"
+            sh "git add xcconfig/Bundle-Version.xcconfig"
+            sh "git commit -m 'Bumped bundle version for Hockey.'"
+        }
+
+        stage('Build (HockeyApp)') {
+            wrap([$class: 'AnsiColorBuildWrapper', 'colorMapName': 'XTerm']) {
+                def xcarchive = "MyApp Ad Hoc.xcarchive"
+
+                sh "xcrun xcodebuild -scheme 'MyApp (Ad Hoc)' -configuration AdHoc archive -archivePath 'build/${xcarchive}' | xcpretty -s"
+                sh "xcrun xcodebuild -exportArchive -exportOptionsPlist exportOptions.plist -archivePath 'build/${xcarchive}' -exportPath build"
+
+                dir('build') {
+                    sh "zip -qr 'MyApp-AdHoc-${env.BUILD_NUMBER}.zip' '${xcarchive}'"
+                }
+
+                dir("build/${xcarchive}") {
+                    sh "zip -qr ../'MyApp (Ad Hoc).dSYM.zip' dSYMs"
+                }
+            }
+        }
+
+        stage('Bundle Version (iTunes Connect)') {
+            if (env.UPLOAD_TO_ITC == "true") {
+                // Increment bundle version and commit (for iTunes Connect)
+                sh "perl -pi -e 's{BUNDLE_VERSION = (\\d+)}{\$n=\$1+1; \"BUNDLE_VERSION = \$n\"}e' '${env.WORKSPACE}'/xcconfig/Bundle-Version.xcconfig"
+                sh "git add xcconfig/Bundle-Version.xcconfig"
+                sh "git commit -m 'Bumped bundle version for iTunes Connect.'"
+            } else {
+                echo "Not building for iTunes Connect."
+            }
+        }
+
+        stage('Build (iTunes Connect)') {
+            if (env.UPLOAD_TO_ITC == "true") {
+                wrap([$class: 'AnsiColorBuildWrapper', 'colorMapName': 'XTerm']) {
+                    def xcarchive = "MyApp App Store.xcarchive"
+
+                    sh "xcrun xcodebuild -scheme 'MyApp' -configuration AppStore archive -archivePath 'build/${xcarchive}' | xcpretty -s"
+                    sh "xcrun xcodebuild -exportArchive -exportOptionsPlist exportOptionsAppStore.plist -archivePath 'build/${xcarchive}' -exportPath build"
+
+                    dir('build') {
+                        sh "zip -qr 'MyApp-AppStore-${env.BUILD_NUMBER}.zip' '${xcarchive}'"
+                    }
+                }
+            } else {
+                echo "Not building for iTunes Connect."
+            }
+        }
+
+        stage('Upload') {
+            wrap([$class: 'AnsiColorBuildWrapper', 'colorMapName': 'XTerm']) {
+                dir('build') {
+                    def commit_sha = sh(script: 'git rev-parse HEAD~1', returnStdout: true).trim()
+
+                    // Upload ipa and dSYMs to Hockey
+                    sh "curl -F \"status=2\" -F \"notify=0\" -F \"notes=@hockey_changes.txt\" -F \"notes_type=1\" -F \"ipa=@MyApp (Ad Hoc).ipa\" -F \"dsym=@MyApp (Ad Hoc).dSYM.zip\" -F \"commit_sha=${commit_sha}\" -H \"X-HockeyAppToken: 0de1ec202d004594a0368ffdbd4fb070\" https://rink.hockeyapp.net/api/2/apps/bd13195c4aec4b0c306b31f243cccbd7/app_versions/upload"
+
+                    if (env.UPLOAD_TO_ITC == "true") {
+                        // Upload to the App Store
+                        sh "fastlane deliver --skip_screenshots --skip_metadata --force -u user@example.com -i 'MyApp.ipa'"
+                    }
+                }
+            }
+        }
+
+        stage('Save') {
+            dir('build') {
+                archiveArtifacts artifacts: '*.zip, *.ipa', fingerprint: true
+            }
+
+            // Push the version commits
+            sh "git push origin HEAD:master"
+
+            if (env.DEPLOY_TYPE == 'Release') {
+                // Tag the release
+                def shortBundleVersion = getShortBundleVersion()
+
+                sh "git tag ${shortBundleVersion}"
+                sh "git push -f origin ${shortBundleVersion}"
+            }
+
+            def endTime = System.currentTimeMillis()
+            def durationString = createDurationString(startTime, endTime)
+
+            if (sendSlackNotifications()) {
+                slackSend channel: '#general', color: 'good', message: slackMessagePrefix() + " Success after ${durationString} (<${env.BUILD_URL}|Open>)"
+            }
+        }
+    } catch (e) {
+        def endTime = System.currentTimeMillis()
+        def durationString = createDurationString(startTime, endTime)
+
+        if (sendSlackNotifications()) {
+            slackSend channel: '#general', color: 'danger', message: slackMessagePrefix() + " Failed after ${durationString} (<${env.BUILD_URL}|Open>)"
+        }
+
+        throw e
+    }
+}
+
+def getBundleVersion() {
+    sh(script: "awk \'/BUNDLE_VERSION =/{ print \$3 }\' \"${env.WORKSPACE}\"/xcconfig/Bundle-Version.xcconfig", returnStdout: true).trim()
+}
+
+def getShortBundleVersion() {
+    sh(script: "awk \'/BUNDLE_VERSION_SHORT =/{ print \$3 }\' \"${env.WORKSPACE}\"/xcconfig/Bundle-Version.xcconfig", returnStdout: true).trim()
+}
+
+def slackMessagePrefix() {
+    def jobName = env.JOB_NAME.replaceAll("/", " - ").replaceAll("%2F", "/")
+
+    "${jobName} (${env.DEPLOY_TYPE}) - #${env.BUILD_NUMBER}"
+}
+
+def createDurationString(startTime, endTime) {
+    def duration = endTime - startTime
+    def minutes = (int)(duration / 60000)
+    def seconds = (int)(duration / 1000) % 60
+
+    /${minutes} min ${seconds} sec/
+}
+
+def colorForBuildResult(build) {
+    if (build == null || build.result == 'SUCCESS') {
+        'good'
+    } else if (build.result == 'UNSTABLE') {
+        'warning'
+    } else {
+        'danger'
+    }
+}
