@@ -36,5 +36,21 @@ class Jenkins_iOS_ExampleTests: XCTestCase {
 
         XCTAssertEqual(counter.count, 10)
     }
+
+    func testDecrement() {
+        let counter = Counter()
+
+        counter.decrement()
+
+        XCTAssertEqual(counter.count, -1)
+    }
+
+    func testDecremetBy() {
+        let counter = Counter()
+
+        counter.decrement(by: 10)
+
+        XCTAssertEqual(counter.count, -10)
+    }
     
 }

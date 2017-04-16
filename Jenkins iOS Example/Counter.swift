@@ -18,4 +18,12 @@ class Counter {
     func increment(by amount: Int) {
         count += amount
     }
+
+    func decrement() {
+        count -= 1
+    }
+
+    func decrement(by amount: Int) {
+        count -= amount
+    }
 }
